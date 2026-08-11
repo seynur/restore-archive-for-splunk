@@ -264,6 +264,166 @@ test_strict_coverage_fails_on_unstamped() {
   rm -rf "$base"
 }
 
+# --- jar + proxy (fake java; no real Zamane / TSA) ---------------------------
+
+# Minimal one-bucket tree for jar-backend proxy tests.
+build_proxy_fixtures() {
+  local base="$1"
+  rm -rf "$base"
+  mkdir -p \
+    "$base/splunkdb/firewall/db/db_100_90_0/rawdata" \
+    "$base/kamusmdb" \
+    "$base/bindir"
+  printf 'hash-proxy' >"$base/splunkdb/firewall/db/db_100_90_0/rawdata/l2Hash_0_p.dat"
+  touch "$base/fake.jar"
+  ln -sf "$SCRIPT_DIR/bin/fake_java" "$base/bindir/java"
+}
+
+# Run create under jar backend with fake java on PATH. Leaves RUN_OUT/RUN_RC.
+# Extra args are NAME=value pairs for env (e.g. KAMUSM_PROXY_IP=…).
+run_jar_create() {
+  local base="$1"
+  shift
+  set +e
+  RUN_OUT="$(
+    env -u KAMUSM_PROXY_IP -u KAMUSM_PROXY_PORT -u KAMUSM_PROXY_USER -u KAMUSM_PROXY_PASSWORD \
+      KAMUSM_BACKEND=jar \
+      KAMUSM_JAR_PATH="$base/fake.jar" \
+      KAMUSM_CUSTOMER_NO=1 \
+      KAMUSM_CUSTOMER_PASSWORD=secret \
+      KAMUSM_TSA_URL=http://tsa.test \
+      KAMUSM_TSA_PORT=80 \
+      PATH="$base/bindir:/usr/bin:/bin" \
+      "$@" \
+      "$CLI" create --splunkdb "$base/splunkdb" --kamusmdb "$base/kamusmdb" --index firewall
+  )"
+  RUN_RC=$?
+  set -e
+}
+
+test_jar_proxy_args_passed_to_java() {
+  echo "TEST: jar create passes KAMUSM_PROXY_* as Zamane CLI args"
+  local base argv_log
+  base="$(mktemp -d)"
+  argv_log="$base/java.argv"
+  build_proxy_fixtures "$base"
+
+  run_jar_create "$base" \
+    KAMUSM_FAKE_JAVA_ARGV_LOG="$argv_log" \
+    KAMUSM_PROXY_IP=10.1.2.3 \
+    KAMUSM_PROXY_PORT=8080 \
+    KAMUSM_PROXY_USER=puser \
+    KAMUSM_PROXY_PASSWORD=ppass
+
+  assert_eq "exit 0" "0" "$RUN_RC"
+  assert_file "token written" "$base/kamusmdb/firewall/db_100_90_0.zd"
+  assert_file "argv log written" "$argv_log"
+  assert_contains "proxy ip in argv" "$(cat "$argv_log")" "10.1.2.3"
+  assert_contains "proxy port in argv" "$(cat "$argv_log")" "8080"
+  assert_contains "proxy user in argv" "$(cat "$argv_log")" "puser"
+  assert_contains "proxy pass in argv" "$(cat "$argv_log")" "ppass"
+  # Ordering: ... customer pass, then proxy fields, then hash alg
+  assert_contains "proxy before hash alg" "$(cat "$argv_log")" \
+    "1 secret 10.1.2.3 8080 puser ppass sha-256"
+
+  rm -rf "$base"
+}
+
+test_jar_omit_proxy_goes_direct_argv() {
+  echo "TEST: jar create omits proxy CLI args when KAMUSM_PROXY_* unset"
+  local base argv_log
+  base="$(mktemp -d)"
+  argv_log="$base/java.argv"
+  build_proxy_fixtures "$base"
+
+  run_jar_create "$base" KAMUSM_FAKE_JAVA_ARGV_LOG="$argv_log"
+
+  assert_eq "exit 0" "0" "$RUN_RC"
+  assert_file "argv log written" "$argv_log"
+  assert_not_contains "no 8080 leak" "$(cat "$argv_log")" "8080"
+  assert_contains "direct arity ends with hash" "$(cat "$argv_log")" \
+    "1 secret sha-256"
+  assert_not_contains "no proxy user" "$(cat "$argv_log")" "puser"
+
+  rm -rf "$base"
+}
+
+test_jar_proxy_traffic_reaches_listener() {
+  echo "TEST: with proxy set, fake java TCP-connects to proxy listener"
+  local base hit_file port listener_pid listener_rc argv_log i
+  base="$(mktemp -d)"
+  hit_file="$base/proxy.hit"
+  argv_log="$base/java.argv"
+  build_proxy_fixtures "$base"
+
+  rm -f "$hit_file"
+  python3 "$SCRIPT_DIR/bin/proxy_listener.py" "$hit_file" 10 >"$base/listener.port" &
+  listener_pid=$!
+  i=0
+  while [[ ! -s "$base/listener.port" && "$i" -lt 50 ]]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  port="$(tr -d '[:space:]' <"$base/listener.port")"
+  if [[ -z "$port" || "$port" == "0" ]]; then
+    echo "  FAIL: listener did not publish port" >&2
+    FAIL=$((FAIL + 1))
+    kill "$listener_pid" 2>/dev/null || true
+    rm -rf "$base"
+    return
+  fi
+
+  run_jar_create "$base" \
+    KAMUSM_FAKE_JAVA_ARGV_LOG="$argv_log" \
+    KAMUSM_FAKE_JAVA_CONNECT=1 \
+    KAMUSM_PROXY_IP=127.0.0.1 \
+    KAMUSM_PROXY_PORT="$port"
+
+  set +e
+  wait "$listener_pid"
+  listener_rc=$?
+  set -e
+
+  assert_eq "create exit 0" "0" "$RUN_RC"
+  assert_eq "listener accepted peer" "0" "$listener_rc"
+  assert_file "proxy hit recorded" "$hit_file"
+  assert_contains "argv used listener port" "$(cat "$argv_log")" "127.0.0.1 $port"
+
+  rm -rf "$base"
+}
+
+test_jar_no_proxy_skips_proxy_listener() {
+  echo "TEST: without proxy, fake java does not connect to proxy listener"
+  local base hit_file port listener_pid listener_rc
+  base="$(mktemp -d)"
+  hit_file="$base/proxy.hit"
+  build_proxy_fixtures "$base"
+
+  rm -f "$hit_file"
+  python3 "$SCRIPT_DIR/bin/proxy_listener.py" "$hit_file" 2 >"$base/listener.port" &
+  listener_pid=$!
+  local i=0
+  while [[ ! -s "$base/listener.port" && "$i" -lt 50 ]]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
+  port="$(tr -d '[:space:]' <"$base/listener.port")"
+
+  # No KAMUSM_PROXY_*; connect flag set but unused without proxy args.
+  run_jar_create "$base" KAMUSM_FAKE_JAVA_CONNECT=1
+
+  set +e
+  wait "$listener_pid"
+  listener_rc=$?
+  set -e
+
+  assert_eq "create exit 0" "0" "$RUN_RC"
+  assert_eq "listener timed out (no traffic)" "1" "$listener_rc"
+  assert_no_file "no proxy hit" "$hit_file"
+
+  rm -rf "$base"
+}
+
 main() {
   [[ -x "$CLI" ]] || chmod +x "$CLI"
   mkdir -p "$SCRIPT_DIR/output"
@@ -279,6 +439,10 @@ main() {
     test_verify_fails_on_bad_token
     test_orphan_zd_does_not_fail
     test_strict_coverage_fails_on_unstamped
+    test_jar_proxy_args_passed_to_java
+    test_jar_omit_proxy_goes_direct_argv
+    test_jar_proxy_traffic_reaches_listener
+    test_jar_no_proxy_skips_proxy_listener
 
     echo ""
     echo "Results: $PASS passed, $FAIL failed"

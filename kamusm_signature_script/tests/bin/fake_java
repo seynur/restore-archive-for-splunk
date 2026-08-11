@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# Test double for `java`. Records argv and optionally opens a TCP connection
+# to the proxy host/port from Zamane -ZC positional args (proves the script
+# wired proxy settings into the jar invocation).
+#
+# Env:
+#   KAMUSM_FAKE_JAVA_ARGV_LOG   — append full argv line here (required for argv tests)
+#   KAMUSM_FAKE_JAVA_CONNECT=1  — if proxy args present, TCP-connect to proxyIP:proxyPort
+#
+# -ZC: writes <input>.zd so _stamp_file_jar succeeds.
+# -CC: exit 0 (verify path unused by proxy tests).
+#
+set -euo pipefail
+
+if [[ -n "${KAMUSM_FAKE_JAVA_ARGV_LOG:-}" ]]; then
+  # shellcheck disable=SC2145
+  printf '%s\n' "$*" >>"$KAMUSM_FAKE_JAVA_ARGV_LOG"
+fi
+
+# Expect: java -jar JARPATH MODE ...
+[[ "${1:-}" == "-jar" ]] || { echo "fake_java: expected -jar" >&2; exit 2; }
+shift 2  # drop -jar and jar path
+
+mode="${1:-}"
+shift || true
+
+case "$mode" in
+  -ZC)
+    # file url port cust pass [proxyIP proxyPort [user pass]] hash
+    local_n=$#
+    if [[ "$local_n" -lt 6 ]]; then
+      echo "fake_java: -ZC needs >=6 args, got $local_n" >&2
+      exit 2
+    fi
+    infile="$1"
+    # hash is always last
+    # shellcheck disable=SC2124
+    # (intentional: count-based parse below)
+
+    if [[ "$local_n" -eq 8 || "$local_n" -eq 10 ]]; then
+      proxy_ip="$6"
+      proxy_port="$7"
+      if [[ "${KAMUSM_FAKE_JAVA_CONNECT:-}" == "1" ]]; then
+        # Open a real TCP session to the proxy address from argv.
+        if command -v nc >/dev/null 2>&1; then
+          nc -z -w 2 "$proxy_ip" "$proxy_port" </dev/null >/dev/null 2>&1 \
+            || { echo "fake_java: proxy connect failed $proxy_ip:$proxy_port" >&2; exit 1; }
+        else
+          (exec 3<>"/dev/tcp/$proxy_ip/$proxy_port") \
+            || { echo "fake_java: proxy connect failed $proxy_ip:$proxy_port" >&2; exit 1; }
+          exec 3<&- 3>&-
+        fi
+      fi
+    elif [[ "$local_n" -eq 6 ]]; then
+      : # direct (no proxy args)
+    else
+      echo "fake_java: unexpected -ZC arity $local_n" >&2
+      exit 2
+    fi
+
+    printf 'FAKE-ZD\n' >"${infile}.zd"
+    ;;
+  -CC)
+    exit 0
+    ;;
+  *)
+    echo "fake_java: unknown mode '$mode'" >&2
+    exit 2
+    ;;
+esac

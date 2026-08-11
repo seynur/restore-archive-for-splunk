@@ -117,13 +117,23 @@ The Zamane jar accepts the customer password (and proxy password, when set) as
 command-line arguments, which can appear in `ps` for a short time. Run under a
 locked-down account on hosts where that risk is acceptable.
 
-## Tests (no network / no jar)
+## Tests
 
 ```bash
 ./tests/run_tests.sh
 ```
 
-This sets `KAMUSM_BACKEND=mock` and builds temporary fixture trees. Test output under `tests/output/` is gitignored.
+Most cases use `KAMUSM_BACKEND=mock` (no jar, no TSA). Proxy coverage uses a
+`tests/bin/fake_java` stub on `PATH` under `KAMUSM_BACKEND=jar`:
+
+- **argv** — with `KAMUSM_PROXY_*` set, Zamane CLI args include
+  `proxyIP proxyPort [user pass]` before the hash alg; when unset, those args
+  are omitted (direct).
+- **traffic** — a local `proxy_listener.py` accepts one TCP connection;
+  `fake_java` connects to the proxy host/port from argv only when proxy is
+  configured (loopback only; no real TSA).
+
+Test output under `tests/output/` is gitignored.
 
 ## Help
 
